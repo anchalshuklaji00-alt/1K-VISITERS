@@ -10,7 +10,7 @@ from Crypto.Util.Padding import pad
 from google.protobuf import json_format
 
 # 🚨 Dhyan dena: Hum yahan tumhari root directory se import kar rahe hain
-import FreeFire_pb2
+from proto import FreeFire_pb2
 
 app = Flask(__name__)
 
