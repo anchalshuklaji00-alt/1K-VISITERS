@@ -7,6 +7,10 @@ import time
 from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+from google.protobuf import json_format
+
+# 🚨 Dhyan dena: Hum yahan tumhari root directory se import kar rahe hain
+import FreeFire_pb2
 
 app = Flask(__name__)
 
@@ -23,59 +27,17 @@ USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
 MAIN_IV  = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 
-# ── AUTO TOKEN UPDATER ───────────────────────────────────────
 FORCE_REFRESH = False
 
-async def fetch_single_token(client, acc, sem):
-    async with sem:
-        try:
-            # Tumhara Cloud API jo seedha JWT nikalta hai bina proto error ke
-            url = f"https://app-py-amber.vercel.app/get?uid={acc['uid']}&password={acc['password']}"
-            resp = await client.get(url, timeout=20)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("status") == "success":
-                    return {"token": data.get("token")}
-        except Exception:
-            pass
-    return None
-
-async def refresh_tokens_api():
-    try:
-        with open("uidpass.json", "r") as f:
-            accounts = json.load(f)
-    except Exception:
-        return False
-
-    sem = asyncio.Semaphore(50)
-    async with httpx.AsyncClient(timeout=30) as client:
-        tasks = [fetch_single_token(client, acc, sem) for acc in accounts[:LIMIT]]
-        results = await asyncio.gather(*tasks)
-    
-    new_tokens = [r for r in results if r]
-    
-    if new_tokens:
-        try:
-            with open("/tmp/tokens.json", "w") as f:
-                json.dump(new_tokens, f)
-        except Exception:
-            pass
-        try:
-            with open("tokens.json", "w") as f:
-                json.dump(new_tokens, f)
-        except Exception:
-            pass
-        return True
-    return False
-
-def get_tokens_path():
-    if os.path.exists("/tmp/tokens.json"):
-        return "/tmp/tokens.json"
-    if os.path.exists("tokens.json"):
-        return "tokens.json"
-    return "tokens.json"
-
 # ── HELPERS ──────────────────────────────────────────────────
+
+def _pad(data: bytes) -> bytes:
+    pad_len = AES.block_size - (len(data) % AES.block_size)
+    return data + bytes([pad_len] * pad_len)
+
+def aes_encrypt(plaintext: bytes) -> bytes:
+    cipher = AES.new(MAIN_KEY, AES.MODE_CBC, MAIN_IV)
+    return cipher.encrypt(_pad(plaintext))
 
 def Encrypt_ID(number):
     try:
@@ -121,6 +83,104 @@ def game_headers(token: str, region: str) -> dict:
         "Connection": "Keep-Alive",
     }
 
+# ── NATIVE TOKEN GENERATOR LOGIC (Protobuf se) ───────────────
+
+async def fetch_access_token(client, credential_str: str):
+    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+    payload = credential_str + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    resp = await client.post(url, data=payload, headers=headers, timeout=15)
+    if resp.status_code == 200:
+        data = resp.json()
+        return data.get("access_token", ""), data.get("open_id", "")
+    return "", ""
+
+async def fetch_jwt_for_account(client, acc):
+    cred_str = f"uid={acc['uid']}&password={acc['password']}"
+    access_token, open_id = await fetch_access_token(client, cred_str)
+    
+    if not access_token:
+        return None
+
+    login_body = {
+        "open_id": open_id,
+        "open_id_type": "4",
+        "login_token": access_token,
+        "orign_platform_type": "4",
+    }
+    
+    login_req = FreeFire_pb2.LoginReq()
+    json_format.ParseDict(login_body, login_req)
+    proto_bytes = login_req.SerializeToString()
+    encrypted = aes_encrypt(proto_bytes)
+
+    url = "https://loginbp.ggblueshark.com/MajorLogin"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip",
+        "Content-Type": "application/octet-stream",
+        "Expect": "100-continue",
+        "X-Unity-Version": "2018.4.11f1",
+        "X-GA": "v1 1",
+        "ReleaseVersion": RELEASE_VERSION,
+    }
+
+    resp = await client.post(url, data=encrypted, headers=headers, timeout=15)
+    if resp.status_code == 200:
+        login_res = FreeFire_pb2.LoginRes()
+        login_res.ParseFromString(resp.content)
+        msg = json.loads(json_format.MessageToJson(login_res))
+        token = msg.get("token", "")
+        if token:
+            return {"token": token, "uid": acc.get("uid")}
+    return None
+
+async def refresh_tokens_routine():
+    try:
+        with open("uidpass.json", "r") as f:
+            accounts = json.load(f)[:LIMIT]
+    except Exception:
+        return False
+
+    sem = asyncio.Semaphore(50)
+    async with httpx.AsyncClient(timeout=30) as client:
+        async def process(acc):
+            async with sem:
+                try:
+                    return await fetch_jwt_for_account(client, acc)
+                except Exception:
+                    return None
+        
+        tasks = [process(acc) for acc in accounts]
+        results = await asyncio.gather(*tasks)
+    
+    new_tokens = [r for r in results if r]
+    
+    if new_tokens:
+        try:
+            with open("/tmp/tokens.json", "w") as f:
+                json.dump(new_tokens, f)
+        except Exception:
+            pass
+        try:
+            with open("tokens.json", "w") as f:
+                json.dump(new_tokens, f)
+        except Exception:
+            pass
+        return True
+    return False
+
+def get_tokens_path():
+    if os.path.exists("/tmp/tokens.json"):
+        return "/tmp/tokens.json"
+    if os.path.exists("tokens.json"):
+        return "tokens.json"
+    return "tokens.json"
+
 # ── ASYNC ACTIONS ────────────────────────────────────────────
 
 async def do_visit(client: httpx.AsyncClient, token: str, target_uid, region: str) -> bool:
@@ -129,7 +189,7 @@ async def do_visit(client: httpx.AsyncClient, token: str, target_uid, region: st
     try:
         payload = encrypt_api(f"08{Encrypt_ID(target_uid)}1007")
         r = await client.post(url, headers=game_headers(token, region), content=payload, timeout=10)
-        # API Error / Token Expired ka check
+        # Token expire detect
         if r.status_code in [401, 403]:
             FORCE_REFRESH = True
         return r.status_code == 200
@@ -145,7 +205,7 @@ async def do_addfriend(client: httpx.AsyncClient, token: str, target_uid, region
             return False
         payload = encrypt_api(f"08{Encrypt_ID(sender_uid)}10{Encrypt_ID(target_uid)}1801")
         r = await client.post(url, headers=game_headers(token, region), content=payload, timeout=10)
-        # API Error / Token Expired ka check
+        # Token expire detect
         if r.status_code in [401, 403]:
             FORCE_REFRESH = True
         return r.status_code == 200
@@ -156,9 +216,9 @@ async def run_bulk(target_uid, action: str, limit: int, region: str) -> dict:
     global FORCE_REFRESH
     
     token_path = get_tokens_path()
-    
-    # 6 hours expiration check aur force refresh logic
     needs_refresh = False
+    
+    # 6 Hours ya Empty hone par refresh logic
     if not os.path.exists(token_path):
         needs_refresh = True
     else:
@@ -170,7 +230,7 @@ async def run_bulk(target_uid, action: str, limit: int, region: str) -> dict:
         FORCE_REFRESH = False
         
     if needs_refresh:
-        await refresh_tokens_api()
+        await refresh_tokens_routine()
         token_path = get_tokens_path()
 
     try:
@@ -179,7 +239,7 @@ async def run_bulk(target_uid, action: str, limit: int, region: str) -> dict:
     except FileNotFoundError:
         return {"error": "tokens.json file nahi mili!"}
 
-    sem = asyncio.Semaphore(50)  # Vercel timeout se bachne ke liye
+    sem = asyncio.Semaphore(50)
 
     async def bounded(token_dict):
         async with sem:
@@ -232,3 +292,4 @@ async def addfriend_endpoint():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
+
